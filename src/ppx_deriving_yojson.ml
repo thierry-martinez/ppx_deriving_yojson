@@ -81,7 +81,7 @@ let parse_options options =
     want_exn = !exn;
   }
 
-let poly_fun names expr =
+let poly_fun ~loc names expr =
   List.fold_right (fun name expr ->
       let name = name.Location.txt in
       [%expr fun [%p pvar ("poly_"^name)] -> [%e expr]]
@@ -98,6 +98,7 @@ and ser_expr_of_only_typ typ =
   let attr_int_encoding typ =
     match attr_int_encoding typ with `String -> "String" | `Int -> "Intlit"
   in
+  let loc = typ.ptyp_loc in
   match typ with
   | [%type: unit]            -> [%expr fun (x:Ppx_deriving_runtime.unit) -> `Null]
   | [%type: int]             -> [%expr fun (x:Ppx_deriving_runtime.int) -> `Int x]
@@ -167,16 +168,17 @@ and ser_expr_of_only_typ typ =
   | { ptyp_desc = Ptyp_alias (typ, name) } ->
     [%expr fun x -> [%e evar ("poly_"^name)] x; [%e ser_expr_of_typ typ] x]
   | { ptyp_desc = Ptyp_poly (names, typ) } ->
-     poly_fun names (ser_expr_of_typ typ)
-  | { ptyp_loc } ->
-    raise_errorf ~loc:ptyp_loc "%s cannot be derived for %s"
+     poly_fun ~loc names (ser_expr_of_typ typ)
+  | _ ->
+    raise_errorf ~loc "%s cannot be derived for %s"
                  deriver (Ppx_deriving.string_of_core_type typ)
 
 (* http://desuchan.net/desu/src/1284751839295.jpg *)
-let rec desu_fold ~path f typs =
+let rec desu_fold ~loc ~path f typs =
   typs |>
   List.mapi (fun i typ -> i, app (desu_expr_of_typ ~path typ) [evar (argn i)]) |>
   List.fold_left (fun x (i, y) ->
+    let loc = x.pexp_loc in
     [%expr [%e y] >>= fun [%p pvar (argn i)] -> [%e x]])
     [%expr Result.Ok [%e f (List.mapi (fun i _ -> evar (argn i)) typs)]]
 and desu_expr_of_typ ~path typ =
@@ -184,6 +186,7 @@ and desu_expr_of_typ ~path typ =
     | Some e -> e
     | None -> desu_expr_of_only_typ ~path typ
 and desu_expr_of_only_typ ~path typ =
+  let loc = typ.ptyp_loc in
   let error = [%expr Result.Error [%e str (String.concat "." path)]] in
   let decode' cases =
     Exp.function_ (
@@ -238,7 +241,7 @@ and desu_expr_of_only_typ ~path typ =
   | [%type: Yojson.Safe.json] -> [%expr fun x -> Result.Ok x]
   | { ptyp_desc = Ptyp_tuple typs } ->
     decode [%pat? `List [%p plist (List.mapi (fun i _ -> pvar (argn i)) typs)]]
-           (desu_fold ~path tuple typs)
+           (desu_fold ~loc ~path tuple typs)
   | { ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc } ->
     let inherits, tags = List.partition (fun field ->
       match field.prf_desc with
@@ -257,7 +260,7 @@ and desu_expr_of_only_typ ~path typ =
         let attrs = field.prf_attributes in
         Exp.case [%pat? `List ((`String [%p pstr (attr_name label attrs)]) :: [%p
                     plist (List.mapi (fun i _ -> pvar (argn i)) typs)])]
-                 (desu_fold ~path (fun x -> (Exp.variant label (Some (tuple x)))) typs)
+                 (desu_fold ~loc ~path (fun x -> (Exp.variant label (Some (tuple x)))) typs)
       | Rtag(label, false, [typ]) ->
         let label = label.txt in
         let attrs = field.prf_attributes in
@@ -295,9 +298,9 @@ and desu_expr_of_only_typ ~path typ =
   | { ptyp_desc = Ptyp_alias (typ, name) } ->
     [%expr fun x -> [%e evar ("poly_"^name)] x; [%e desu_expr_of_typ ~path typ] x]
   | { ptyp_desc = Ptyp_poly (names, typ) } ->
-     poly_fun names (desu_expr_of_typ ~path typ)
-  | { ptyp_loc } ->
-    raise_errorf ~loc:ptyp_loc "%s cannot be derived for %s"
+     poly_fun ~loc names (desu_expr_of_typ ~path typ)
+  | _ ->
+    raise_errorf ~loc "%s cannot be derived for %s"
                  deriver (Ppx_deriving.string_of_core_type typ)
 
 let wrap_runtime decls =
@@ -306,13 +309,14 @@ let wrap_runtime decls =
 let ser_type_of_decl ~options ~path:_ type_decl =
   ignore (parse_options options);
   let typ = Ppx_deriving.core_type_of_type_decl type_decl in
+  let loc = type_decl.ptype_loc in
   let polymorphize = Ppx_deriving.poly_arrow_of_type_decl
                        (fun var -> [%type: [%t var] -> Yojson.Safe.t]) type_decl in
   polymorphize [%type: [%t typ] -> Yojson.Safe.t]
 
-let ser_str_of_record varname labels =
+let ser_str_of_record ~loc varname labels =
   let fields =
-    labels |> List.mapi (fun _i { pld_name = { txt = name }; pld_type; pld_attributes } ->
+    labels |> List.mapi (fun _i { pld_loc = loc; pld_name = { txt = name }; pld_type; pld_attributes } ->
       let field  = Exp.field (evar varname) (mknoloc (Lident name)) in
       let result = [%expr [%e str (attr_key name pld_attributes)],
                     [%e ser_expr_of_typ @@ type_add_attrs pld_type pld_attributes] [%e field]] in
@@ -324,7 +328,9 @@ let ser_str_of_record varname labels =
   in
   let assoc =
     List.fold_left
-      (fun expr field -> [%expr let fields = [%e field] in [%e expr]])
+      (fun expr field ->
+        let loc = expr.pexp_loc in
+        [%expr let fields = [%e field] in [%e expr]])
       [%expr `Assoc fields] fields
   in
   [%expr let fields = [] in [%e assoc]]
@@ -410,14 +416,14 @@ let ser_str_of_type ~options ~path ({ ptype_loc = loc } as type_decl) =
               (pconstr name' (List.mapi (fun i _ -> pvar (argn i)) args))
               [%expr `List ((`String [%e str json_name]) :: [%e list arg_exprs])]
           | Pcstr_record labels ->
-            let arg_expr = ser_str_of_record (argn 0) labels in
+            let arg_expr = ser_str_of_record ~loc (argn 0) labels in
             Exp.case
               (pconstr name' [pvar(argn 0)])
               [%expr `List ((`String [%e str json_name]) :: [%e list[arg_expr]])]
           )
         |> Exp.function_
       | Ptype_record labels, _ ->
-        [%expr fun x -> [%e ser_str_of_record "x" labels]]
+        [%expr fun x -> [%e ser_str_of_record ~loc "x" labels]]
       | Ptype_abstract, None ->
         raise_errorf ~loc "%s cannot be derived for fully abstract types" deriver
     in
@@ -485,24 +491,29 @@ let ser_str_of_type_ext ~options ~path:_ ({ ptyext_path = { loc }} as type_ext) 
   let body = [%expr let fallback = [%e field] in [%e set_field]] in
   [Str.value ?loc:None Nonrecursive [Vb.mk (Pat.construct (lid "()") None) body]]
 
-let error_or typ = [%type: [%t typ] Ppx_deriving_yojson_runtime.error_or]
+let error_or typ =
+  let loc = typ.ptyp_loc in
+  [%type: [%t typ] Ppx_deriving_yojson_runtime.error_or]
 
 let desu_type_of_decl_poly ~options ~path:_ type_decl type_ =
   ignore (parse_options options);
+  let loc = type_decl.ptype_loc in
   let polymorphize = Ppx_deriving.poly_arrow_of_type_decl
                        (fun var -> [%type: Yojson.Safe.t -> [%t error_or var]]) type_decl in
   polymorphize type_
 
 let desu_type_of_decl ~options ~path type_decl =
+  let loc = type_decl.ptype_loc in
   let typ = Ppx_deriving.core_type_of_type_decl type_decl in
   desu_type_of_decl_poly ~options ~path type_decl [%type: Yojson.Safe.t -> [%t error_or typ]]
 
 
-let desu_str_of_record ~is_strict ~error ~path wrap_record labels =
+let desu_str_of_record ~loc ~is_strict ~error ~path wrap_record labels =
   let top_error = error path in
   let record =
     List.fold_left
       (fun expr i ->
+        let loc = expr.pexp_loc in
         [%expr [%e evar (argn i)] >>= fun [%p pvar (argn i)] -> [%e expr]]
       )
       ( let r =
@@ -514,7 +525,7 @@ let desu_str_of_record ~is_strict ~error ~path wrap_record labels =
       (labels |> List.mapi (fun i _ -> i)) in
   let default_case = if is_strict then top_error else [%expr loop xs _state] in
   let cases =
-    (labels |> List.mapi (fun i { pld_name = { txt = name }; pld_type; pld_attributes } ->
+    (labels |> List.mapi (fun i { pld_loc = loc; pld_name = { txt = name }; pld_type; pld_attributes } ->
         let path = path @ [name] in
         let thunks = labels |> List.mapi (fun j _ ->
              if i = j
@@ -601,17 +612,17 @@ let desu_str_of_type ~options ~path ({ ptype_loc = loc } as type_decl) =
       | Ptype_abstract, Some manifest ->
         desu_expr_of_typ ~path manifest
       | Ptype_variant constrs, _ ->
-        let cases = List.map (fun { pcd_name = { txt = name' }; pcd_args; pcd_attributes } ->
+        let cases = List.map (fun { pcd_loc = loc; pcd_name = { txt = name' }; pcd_args; pcd_attributes } ->
           match pcd_args with
           | Pcstr_tuple(args) ->
             Exp.case
               [%pat? `List ((`String [%p pstr (attr_name name' pcd_attributes)]) ::
                                      [%p plist (List.mapi (fun i _ -> pvar (argn i)) args)])]
-              (desu_fold ~path (fun x -> constr name' x) args)
+              (desu_fold ~loc ~path (fun x -> constr name' x) args)
           | Pcstr_record labels ->
             let wrap_record r = constr name' [r] in
             let sub =
-              desu_str_of_record ~is_strict ~error ~path wrap_record labels in
+              desu_str_of_record ~loc ~is_strict ~error ~path wrap_record labels in
             Exp.case
               [%pat? `List ((`String [%p pstr (attr_name name' pcd_attributes)]) ::
                               [%p plist [pvar (argn 0)]])]
@@ -620,7 +631,7 @@ let desu_str_of_type ~options ~path ({ ptype_loc = loc } as type_decl) =
         in
         Exp.function_ (cases @ [Exp.case [%pat? _] top_error])
       | Ptype_record labels, _ ->
-        desu_str_of_record ~is_strict ~error ~path (fun r -> r) labels
+        desu_str_of_record ~loc ~is_strict ~error ~path (fun r -> r) labels
       | Ptype_abstract, None ->
         raise_errorf ~loc "%s cannot be derived for fully abstract types" deriver
     in
@@ -669,7 +680,7 @@ let desu_str_of_type_ext ~options ~path ({ ptyext_path = { loc } } as type_ext) 
               Exp.case
                 [%pat? `List ((`String [%p pstr (attr_name name' pext_attributes)]) ::
                                        [%p plist (List.mapi (fun i _ -> pvar (argn i)) args)])]
-                (desu_fold ~path (fun x -> constr name' x) args)
+                (desu_fold ~loc ~path (fun x -> constr name' x) args)
             | Pcstr_record _ ->
               raise_errorf ~loc "%s: record variants are not supported in extensible types" deriver
           in
@@ -711,6 +722,7 @@ let ser_sig_of_type ~options ~path type_decl =
       (Ppx_deriving.fold_left_type_decl (fun acc name -> name :: acc) [] type_decl)
     in
     let typ = Ppx_deriving.core_type_of_type_decl type_decl in
+    let loc = typ.ptyp_loc in
     let polymorphize_ser  = Ppx_deriving.poly_arrow_of_type_decl
       (fun var -> [%type: [%t var] -> Yojson.Safe.t]) type_decl
     in
@@ -739,6 +751,7 @@ let desu_sig_of_type ~options ~path type_decl =
                       (desu_type_of_decl ~options ~path type_decl))
   in
   let typ = Ppx_deriving.core_type_of_type_decl type_decl in
+  let loc = typ.ptyp_loc in
   let of_yojson_exn =
     Sig.value (Val.mk (mknoloc (Ppx_deriving.mangle_type_decl (`Suffix "of_yojson_exn") type_decl))
                       (desu_type_of_decl_poly ~options ~path type_decl [%type: Yojson.Safe.t -> [%t typ]]))
@@ -777,6 +790,7 @@ let desu_sig_of_type_ext ~options:_ ~path:_ _type_ext = []
 
 let yojson_str_fields ~options ~path:_ type_decl =
   let { want_meta; _ } = parse_options options in
+  let loc = type_decl.ptype_loc in
   match want_meta, type_decl.ptype_kind with
   | false, _ | true, Ptype_open -> []
   | true, kind ->
@@ -786,7 +800,9 @@ let yojson_str_fields ~options ~path:_ type_decl =
         labels |> List.map (fun { pld_name = { txt = name }; pld_attributes } ->
           [%expr [%e str (attr_key name pld_attributes)]])
       in
-      let flist = List.fold_right (fun n acc -> [%expr [%e n] :: [%e  acc]])
+      let flist = List.fold_right (fun n acc ->
+        let loc = n.pexp_loc in
+        [%expr [%e n] :: [%e  acc]])
         fields [%expr []]
       in
         [
@@ -800,6 +816,7 @@ let yojson_str_fields ~options ~path:_ type_decl =
 
 let yojson_sig_fields ~options ~path:_ type_decl =
   let { want_meta; _ } = parse_options options in
+  let loc = type_decl.ptype_loc in
   match want_meta, type_decl.ptype_kind with
   | false, _ | true, Ptype_open -> []
   | true, kind ->
